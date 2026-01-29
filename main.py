@@ -15,23 +15,39 @@ class MyPlugin(Star):
         self.task = None
         
         # 配置处理
-        self.target_group = self.config.get("target_group")
-        if self.target_group and not str(self.target_group).isdigit():
-            logger.error(f"target_group '{self.target_group}' 不是有效数字")
-            self.target_group = None
+        target_group_raw = self.config.get("target_group")
+        self.target_group = None
+        if target_group_raw is not None:
+            target_group_str = str(target_group_raw)
+            if target_group_str.isdigit():
+                self.target_group = target_group_str
+            else:
+                logger.error(f"target_group '{target_group_raw}' 不是有效数字")
 
         self.server_name = self.config.get("server_name", "Minecraft服务器")
         self.server_ip = self.config.get("server_ip")
-        self.server_port = self.config.get("server_port")
-        self.check_interval = int(self.config.get("check_interval", 10))
+        
+        # 安全地转换端口号
+        try:
+            self.server_port = int(self.config.get("server_port", 25565))
+        except (ValueError, TypeError):
+            logger.error(f"server_port 配置无效，使用默认值 25565")
+            self.server_port = 25565
+            
+        try:
+            self.check_interval = int(self.config.get("check_interval", 10))
+        except (ValueError, TypeError):
+            logger.error(f"check_interval 配置无效，使用默认值 10")
+            self.check_interval = 10
+            
         self.enable_auto_monitor = self.config.get("enable_auto_monitor", False)
         
         # 缓存数据
         self.last_player_count = None
-        self.last_player_list = []
+        self.last_player_list = set()
         
-        if not self.target_group or not self.server_ip or not self.server_port:
-            logger.error("配置不完整(target_group/ip/port)，监控无法启动")
+        if not self.target_group or not self.server_ip:
+            logger.error("配置不完整(target_group/server_ip缺失)，监控无法启动")
             self.enable_auto_monitor = False
         else:
             logger.info(f"MC监控已加载 | 服务器: {self.server_ip}:{self.server_port}")
@@ -49,7 +65,7 @@ class MyPlugin(Star):
         """获取一言"""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get("https://v1.hitokoto.cn/?encode=text", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                async with session.get("https://v1.hitokoto.cn/?encode=text", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     return await resp.text() if resp.status == 200 else None
         except Exception as e:
             logger.debug(f"获取一言失败: {e}")
@@ -103,6 +119,17 @@ class MyPlugin(Star):
 
     async def _ping_server(self, host, port):
         """使用Minecraft Server List Ping协议直接查询服务器"""
+        # 验证输入
+        if not host or not isinstance(host, str) or not host.strip():
+            logger.error("无效的服务器地址")
+            return None
+            
+        try:
+            port = int(port)
+        except (ValueError, TypeError):
+            logger.error(f"无效的端口号: {port}")
+            return None
+            
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=5.0
@@ -119,7 +146,7 @@ class MyPlugin(Star):
                 + self._pack_varint(-1)  # Protocol version: -1 for status
                 + self._pack_varint(len(host_bytes))
                 + host_bytes
-                + struct.pack(">H", int(port))
+                + struct.pack(">H", port)
                 + self._pack_varint(1)  # Next state: 1 for status
             )
             packet = self._pack_varint(len(handshake)) + handshake
@@ -132,37 +159,35 @@ class MyPlugin(Star):
             await writer.drain()
 
             # 读取响应
-            async def read_response():
-                length = await self._read_varint(reader)
-                packet_id = await self._read_varint(reader)
+            length = await self._read_varint(reader)
+            packet_id = await self._read_varint(reader)
 
-                if packet_id == 0:
-                    json_len = await self._read_varint(reader)
-                    data = await reader.readexactly(json_len)
-                    decoded_data = data.decode("utf-8")
-                    logger.debug(f"MC Server response: {decoded_data}")
-                    return json.loads(decoded_data)
-                return None
-
-            return await asyncio.wait_for(read_response(), timeout=5.0)
+            if packet_id == 0:
+                json_len = await self._read_varint(reader)
+                data = await reader.readexactly(json_len)
+                decoded_data = data.decode("utf-8")
+                logger.debug(f"MC Server response: {decoded_data}")
+                return json.loads(decoded_data)
+            return None
 
         except Exception as e:
-            logger.warning(f"服务器Ping失败: {e}")
+            logger.warning(f"服务器Ping失败 ({type(e).__name__}): {e}")
             return None
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
-            except (ConnectionError, OSError, asyncio.CancelledError):
-                pass
+            except Exception as e:
+                logger.debug(f"关闭连接时出错: {e}")
 
     async def _fetch_server_data(self):
         """获取Minecraft服务器数据（使用直接Socket连接）"""
         if not self.server_ip or not self.server_port:
+            logger.error("服务器IP或端口未配置")
             return None
         
         try:
-            data = await self._ping_server(self.server_ip, int(self.server_port))
+            data = await self._ping_server(self.server_ip, self.server_port)
             logger.debug(f"MC Server raw data: {data}")
 
             if not data:
@@ -312,7 +337,15 @@ class MyPlugin(Star):
             if not platform:
                 logger.error("无法获取AIOCQHTTP平台")
                 return
-            await platform.get_client().api.call_action('send_group_msg', group_id=int(self.target_group), message=text)
+            
+            # 安全转换群号为整数
+            try:
+                group_id = int(self.target_group)
+            except (ValueError, TypeError):
+                logger.error(f"无效的群号: {self.target_group}")
+                return
+                
+            await platform.get_client().api.call_action('send_group_msg', group_id=group_id, message=text)
         except Exception as e:
             logger.error(f"消息发送失败: {e}")
 
@@ -348,7 +381,7 @@ class MyPlugin(Star):
     @filter.command("reset_monitor")
     async def cmd_reset(self, event: AstrMessageEvent):
         self.last_player_count = None
-        self.last_player_list = []
+        self.last_player_list = set()
         yield event.plain_result("🔄 缓存已重置，下次检测将视为首次")
 
     @filter.command("set_group")
